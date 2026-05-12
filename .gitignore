@@ -24,4 +24,5 @@ paper/*.fls
 paper/*.fdb_latexmk
 paper/*.log
 paper/*.out
+paper/*.xdv
 paper/*.synctex.gz

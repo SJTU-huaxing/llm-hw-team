@@ -125,11 +125,11 @@ Plots are saved in `results/`:
 
 ## Paper
 
-The English NeurIPS-style paper is under `paper/` and compiles to `paper/main.pdf`:
+The English NeurIPS-style paper is under `paper/` and compiles to `paper/main.pdf`. It uses XeLaTeX so the Chinese author names render correctly:
 
 ```powershell
 cd paper
-latexmk -pdf main.tex
+latexmk -xelatex main.tex
 ```
 
 ## References

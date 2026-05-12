@@ -1,8 +1,11 @@
+% !TeX program = xelatex
 \documentclass{article}
 
 \usepackage[preprint]{neurips_2025}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setmainfont{Times New Roman}
+\setCJKmainfont{SimSun}
 \usepackage{hyperref}
 \usepackage{url}
 \usepackage{booktabs}
@@ -13,7 +16,7 @@
 \title{Balanced Expected-Pyramid KVPress Compression for Training-Free Pythia-70M Inference}
 
 \author{%
-  Group Project Team\\
+  姜道睿 \quad 丁昊 \quad 章岑硕\\
   Shanghai Jiao Tong University\\
   \texttt{https://github.com/SJTU-huaxing/llm-hw-team.git}
 }
@@ -137,7 +140,7 @@ Reproducibility is handled at the project level. The Conda environment pins KVPr
 
 \section{Team Contributions}
 
-Replace these placeholders with final member names and IDs before submission. Member A: method design and implementation (40\%). Member B: experiments and analysis (35\%). Member C: paper writing and reproducibility (25\%).
+姜道睿: method design, KVPress implementation, and final integration (40\%). 丁昊: experiments, benchmark runs, and result analysis (35\%). 章岑硕: paper writing, reproducibility documentation, and final checking (25\%).
 
 \bibliographystyle{plainnat}
 \bibliography{references}
