@@ -32,6 +32,8 @@ The KV cache stores one key and value vector per layer and token, so long-contex
 
 Pythia-70M~\citep{biderman2023pythia} uses GPT-NeoX attention modules and partial RoPE, while several KVPress utilities assume LLaMA-like module names and full-dimensional RoPE. Our adapter only supplies these structural aliases and the partial-RoPE correction needed for ExpectedAttention. All compression decisions are implemented as KVPress-style presses that gather existing KV tensors along the sequence dimension.
 
+Our goal is therefore not to design a new model architecture, but to identify an inference-only policy that is useful under the assignment constraints. We treat quality and latency as a joint objective: a method that is slightly faster but severely increases perplexity is not acceptable, and a method that preserves quality while adding expensive bookkeeping is also unattractive at the small Pythia-70M scale. This motivates a conservative innovation: keep the strongest token-importance signal from KVPress, then only alter how the cache budget is distributed across layers.
+
 \section{Method}
 
 Table~\ref{tab:layers} summarizes how the implementation covers the assignment layers. Official baselines include attention sink retention~\citep{xiao2023streamingllm}, observed attention from SnapKV/PyramidKV~\citep{li2024snapkv,cai2024pyramidkv}, H2O-style heavy-hitter scoring~\citep{zhang2023h2o}, and TOVA~\citep{tova2024}.
@@ -64,11 +66,17 @@ s = 0.55\,\hat{s}_{\mathrm{expected}} + 0.30\,\hat{s}_{\mathrm{observed}} + 0.15
 \]
 where each score is min-max normalized per batch and head. Sink tokens and a 32-token recent window receive a protection boost before top-$k$ selection. Residual and soft-pyramid hybrid variants are retained as ablations.
 
+The implementation follows the same prefill-once abstraction for every method. Given a context of length $L$, KVPress first builds the dense cache, the press scores the cached positions, and the resulting indices are gathered from the key and value tensors. During decoding, no further model weights or attention equations are changed; the model simply attends to the shortened cache. For Pyramid-style methods, different layers may have different retained lengths. The Pythia adapter records these per-layer lengths and slices masks accordingly, so the reported memory and FLOPs use the actual cache shape rather than the nominal target budget.
+
+We considered more aggressive innovations, including expected-observed residual scores and a residual soft pyramid. These variants are meaningful because observed attention can identify heavy hitters in the concrete prompt, while value-norm scores can favor tokens with larger downstream contribution. However, early experiments showed that forcing recent or observed-heavy tokens can overfit to local continuation patterns. Expected Soft Pyramid was chosen as the main custom method because it changes only the inter-layer allocation and leaves the more robust ExpectedAttention ordering intact.
+
 \section{Experiments}
 
 We evaluate `EleutherAI/pythia-70m' on WikiText-2 test~\citep{merity2017wikitext} and one PG-19 test stream sample~\citep{rae2019compressive}. For PPL, a 512-token context is prefetched and compressed before scoring the next 128 continuation tokens. For generation, a 512-token PG-19 prompt generates 32 tokens. The decode attention FLOPs proxy is $\sum_{\ell,t}4HDL_{\ell,t}$. Reported runs use an NVIDIA GeForce RTX 5060 Laptop GPU.
 
 We first screen new baselines and hybrids on 256-token contexts and target cache sizes 96, 128, and 192. The strongest new official baselines are ObservedAttention and TOVA, so the final table keeps them alongside the original methods. The balanced selection rule filters methods with kept fraction above 0.5 and ranks the remaining methods by average PPL, TPOT, and FLOPs ratio with equal weight.
+
+All scripts write CSV and JSON files with the KVPress version, Transformers version, target cache size, compression ratio, per-layer cache lengths, and CUDA memory. This is important because two methods can share the same average kept fraction while having different layer distributions. For example, ExpectedAttention at target 132 keeps 132 tokens in every layer, whereas Expected Soft Pyramid keeps $[165,152,139,125,112,99]$ tokens across the six Pythia layers. Both average to 132, but the latter spends more budget in early layers and less in later layers.
 
 \begin{table}[h]
 \centering
@@ -119,7 +127,13 @@ Target & Selected policy & Avg PPL & TPOT & FLOPs \\
 
 The main result is not that a more complicated scorer always wins. ExpectedAttention is clearly the quality anchor, especially on WikiText-2. The successful innovation is conservative: Expected Soft Pyramid changes the inter-layer budget while keeping the ExpectedAttention scorer intact. It gives up about 2 average PPL relative to ExpectedAttention at target 132, but improves TPOT and remains on the Pareto frontier. In contrast, adding observed-attention residuals improves some PG-19 cases but tends to damage WikiText quality, so we report those variants as negative ablations rather than the recommended method.
 
+The difference between WikiText-2 and PG-19 is instructive. WikiText-2 passages are shorter and more locally coherent, so removing globally useful context hurts more visibly; ExpectedAttention is best because it estimates future positions instead of only looking at recent observed attention. PG-19 contains long book-like text, where local repetition and narrative continuity make sink, recent, and observed-heavy policies less harmful. This explains why several observed or hybrid methods have competitive PG-19 PPL but worse average PPL. The final selection rule deliberately averages both datasets so that the method does not specialize to one text style.
+
+The speed results should be interpreted as a proxy for cache efficiency rather than a universal deployment claim. Pythia-70M is small enough that Python overhead, CUDA synchronization, and pipeline setup can be comparable to the saved attention computation. For this reason, we report TTFT, TPOT, throughput, peak memory, kept fraction, and decode-attention FLOPs together. The consistent FLOPs reduction from roughly 1.0 to 0.281 at target 132 confirms that the compressed methods reduce the theoretical attention work, while the TPOT differences show the practical overhead of each scoring and layer-budget choice.
+
 The evaluation is intentionally small and reproducible: one model, no training, two datasets, fixed seeds, and one GPU. Timing differences are small at Pythia-70M scale, so the paper reports exact CSVs rather than over-claiming hardware speedups. We do not implement MQA/GQA/MLA or YOCO-style cross-layer sharing because those require architecture or weight changes outside the no-training setting. KVPress SimLayerKV is excluded because its full-RoPE assumption is incompatible with GPT-NeoX partial RoPE without further changes.
+
+Reproducibility is handled at the project level. The Conda environment pins KVPress 0.5.3, Transformers 4.57.6, and CUDA PyTorch; the README lists the exact commands for smoke tests, PPL evaluation, generation benchmarking, plot generation, and paper compilation. The repository also keeps the exploratory candidate files, so the negative residual experiments can be audited rather than hidden. This makes the final recommendation modest but traceable: use ExpectedAttention for best quality, use SnapKV when only TPOT matters, and use Expected Soft Pyramid when a balanced PPL-speed tradeoff under aggressive compression is preferred.
 
 \section{Team Contributions}
 
