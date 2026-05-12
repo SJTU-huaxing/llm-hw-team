@@ -1,0 +1,18 @@
+name: llm_kvpress_team
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.10.0+cu130
+      - transformers==4.57.6
+      - kvpress==0.5.3
+      - datasets>=2.21
+      - accelerate>=1.0
+      - tqdm>=4.66
+      - pandas>=2.2
+      - matplotlib>=3.8
+      - safetensors>=0.4
+      - psutil>=5.9

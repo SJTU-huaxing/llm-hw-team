@@ -1,0 +1,125 @@
+\documentclass{article}
+
+\usepackage[preprint]{neurips_2025}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+\title{Combining KVPress Cache Compression Layers for Training-Free Pythia-70M Inference}
+
+\author{%
+  Group Project Team\\
+  Shanghai Jiao Tong University\\
+  \texttt{https://github.com/SJTU-huaxing/llm-hw-team.git}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+KV cache memory is a major bottleneck for autoregressive decoding. This project studies training-free KV cache compression for EleutherAI/Pythia-70M using NVIDIA KVPress. We reproduce Dense, StreamingLLM, SnapKV, PyramidKV, and ExpectedAttention baselines, then implement a small KVPress-compatible composition, Layer-Adaptive Expected Pyramid, that combines expected-attention token scoring, layer-wise pyramid budgets, and a conservative observed-attention lazy-layer gate. On WikiText-2 and PG-19, ExpectedAttention is the most robust policy under aggressive 4x prompt-cache compression, while Expected+Pyramid gives the lowest measured TPOT in the 512-token PG-19 generation benchmark. A 2x cache budget nearly recovers Dense perplexity while roughly halving the decode attention FLOPs proxy. The code, environment file, results, plots, and this paper are fully reproducible from the linked repository.
+\end{abstract}
+
+\section{Introduction}
+
+Long-context inference stores one key and value vector per token, layer, and attention head. The KV cache therefore grows linearly with context length and directly affects memory footprint and decoding attention work. The assignment asks us to integrate acceleration ideas from four levels: attention mechanisms, per-layer cache compression, inter-layer cache allocation, and macro-level inference architecture.
+
+We keep the base model fixed, use no training, and build on KVPress~\citep{kvpress}, which hooks Transformers models during prefill and compresses the KV cache before decoding. The main engineering challenge is that Pythia-70M~\citep{biderman2023pythia} uses GPT-NeoX modules named \texttt{gpt\_neox.layers[*].attention} and partial rotary embeddings, whereas several KVPress utilities assume LLaMA-like \texttt{model.layers[*].self\_attn} modules. We add a thin compatibility shim but keep compression algorithms inside KVPress-style press objects.
+
+\section{Method}
+
+Table~\ref{tab:layers} maps the assignment layers to the implemented components. Dense uses the full cache. StreamingLLM~\citep{xiao2023streamingllm} keeps sink and recent tokens. SnapKV~\citep{li2024snapkv} uses observed attention from an observation window. PyramidKV~\citep{cai2024pyramidkv} applies non-uniform layer budgets. ExpectedAttention estimates future attention from query statistics through KVPress.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Implemented mapping from assignment layers to project components.}
+\label{tab:layers}
+\begin{tabular}{ll}
+\toprule
+Layer & Implementation \\
+\midrule
+Attention mechanism & ExpectedAttention score; observed-attention statistics \\
+Per-layer KV compression & StreamingLLM, SnapKV, PyramidKV, ExpectedAttention top-$k$ \\
+Inter-layer KV compression & Pyramid layer budgets and layer-adaptive lazy gate \\
+Macro architecture & KVPress Transformers pipeline with prefill-once compression \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Our custom press, Layer-Adaptive Expected Pyramid, first assigns lower layers larger budgets and higher layers smaller budgets, following PyramidKV. If the last queries in a layer place sufficiently concentrated mass on sink and recent tokens, a lazy gate keeps only those deterministic positions; otherwise it uses ExpectedAttention top-$k$ selection. The implementation only gathers KV tensors on the sequence dimension and does not alter model weights, train adapters, or change attention semantics. Since Pythia uses partial RoPE, we override the expected-attention RoPE averaging step to rotate only the GPT-NeoX rotary subspace and leave the remaining head dimensions unchanged.
+
+\section{Experiments}
+
+We evaluate \texttt{EleutherAI/pythia-70m} with Transformers~\citep{wolf2020transformers} and KVPress 0.5.3. Results use fp32 eager attention on an NVIDIA GeForce RTX 5060 Laptop GPU. Datasets are WikiText-2 test~\citep{merity2017wikitext} and one PG-19 test stream sample~\citep{rae2019compressive}. For perplexity, we prefill and compress a 512-token context, then score the next 128 continuation tokens one by one. For generation, we use a 512-token PG-19 prompt and generate 32 tokens. The FLOPs value is a decode attention proxy proportional to $\sum_{\ell,t}4H D L_{\ell,t}$.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Continuation PPL at target cache size 132, approximately 4x prompt-cache compression.}
+\label{tab:ppl132}
+\begin{tabular}{lrrr}
+\toprule
+Policy & WikiText-2 & PG-19 & Kept \\
+\midrule
+Dense & 9.750 & 32.938 & 1.000 \\
+StreamingLLM & 59.632 & 32.663 & 0.258 \\
+SnapKV & 51.625 & 33.056 & 0.258 \\
+PyramidKV & 43.884 & 32.286 & 0.259 \\
+ExpectedAttention & 17.791 & 34.860 & 0.258 \\
+Expected+Pyramid & 36.236 & 33.896 & 0.259 \\
+Layer-adaptive Expected+Pyramid & 41.307 & 33.251 & 0.259 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\caption{PG-19 generation at target cache size 132. FLOPs ratio is relative to Dense.}
+\label{tab:gen132}
+\begin{tabular}{lrrrr}
+\toprule
+Policy & TTFT & TPOT & tok/s & FLOPs ratio \\
+\midrule
+Dense & 0.0611 & 0.00660 & 120.4 & 1.000 \\
+StreamingLLM & 0.00744 & 0.00682 & 146.2 & 0.281 \\
+SnapKV & 0.00705 & 0.00683 & 146.3 & 0.281 \\
+PyramidKV & 0.00721 & 0.00628 & 158.5 & 0.282 \\
+ExpectedAttention & 0.00604 & 0.00589 & 169.6 & 0.281 \\
+Expected+Pyramid & 0.00546 & 0.00533 & 187.5 & 0.282 \\
+Layer-adaptive Expected+Pyramid & 0.00591 & 0.00611 & 163.8 & 0.282 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At the aggressive cache size of 132, ExpectedAttention has the best average PPL among compressed methods, while Expected+Pyramid has the lowest measured TPOT. We then sweep target cache sizes 192 and 256. The best average PPL at 192 is 22.399 for Expected+Pyramid and the conservative custom variant; at 256, ExpectedAttention reaches 21.967 versus Dense at 21.344, while keeping half the prompt cache. Figure~\ref{fig:tradeoff} summarizes the fixed-budget quality-latency tradeoff, and the repository includes a budget sweep plot.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.72\linewidth]{../results/quality_latency_tradeoff.png}
+\caption{Average PPL versus TPOT at target cache size 132. Marker size reflects prompt KV kept fraction.}
+\label{fig:tradeoff}
+\end{figure}
+
+\section{Analysis and Limitations}
+
+The experiments show that token importance scoring matters more than the exact layer budget at very small caches: ExpectedAttention is strong on WikiText-2, whereas sink+recent policies degrade sharply. PG-19 is less sensitive in this single-sample setting, where several compressed policies match or slightly improve Dense PPL due to sample noise. The custom lazy gate is useful as a conservative composition mechanism, but lower thresholds hurt quality; the final sweep therefore uses a high threshold of 0.99, which avoids forcing a lazy fallback when observed attention concentration is uncertain.
+
+There are several limitations. We use a small model and one PG-19 sample because the assignment fixes Pythia-70M and training-free inference. FLOPs are estimated for decode attention only, not measured by a hardware profiler. We did not implement true MQA/GQA/MLA or YOCO-style cross-layer sharing because those require architecture or weight changes and would violate the no-training constraint. We also report that KVPress \texttt{SimLayerKVPress} was excluded after a smoke test because its full-RoPE assumption is incompatible with GPT-NeoX partial RoPE without further algorithmic changes.
+
+\section{Team Contributions}
+
+The team contribution table is a placeholder for the final submitter to edit with real names and student IDs. Member A handled method design and implementation (40\%). Member B handled experiments and analysis (35\%). Member C handled paper writing and reproducibility (25\%).
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
