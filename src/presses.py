@@ -34,11 +34,14 @@ VALID_POLICIES: tuple[str, ...] = (
     "chunk_expected",
     "hybrid_expected_observed",
     "hybrid_soft_pyramid",
+    "expected_observed_residual",
+    "expected_soft_pyramid",
+    "residual_soft_pyramid",
 )
 POLICY_ALIASES = {
     "full": "dense",
-    "proposed": "hybrid_soft_pyramid",
-    "balanced": "hybrid_soft_pyramid",
+    "proposed": "expected_soft_pyramid",
+    "balanced": "expected_soft_pyramid",
 }
 
 
@@ -448,6 +451,113 @@ class HybridSoftPyramidPress(HybridExpectedObservedPress):
         return apply_press_to_cache(self, module, input_args, kwargs, output)
 
 
+class ExpectedObservedResidualPress(HybridExpectedObservedPress):
+    """ExpectedAttention-dominant scorer with small observed/value residuals."""
+
+    def __init__(
+        self,
+        compression_ratio: float = 0.0,
+        n_future_positions: int = 512,
+        n_sink: int = 4,
+        expected_weight: float = 0.85,
+        observed_weight: float = 0.10,
+        value_weight: float = 0.05,
+    ) -> None:
+        super().__init__(
+            compression_ratio=compression_ratio,
+            n_future_positions=n_future_positions,
+            n_sink=n_sink,
+            n_recent=0,
+            expected_weight=expected_weight,
+            observed_weight=observed_weight,
+            value_weight=value_weight,
+        )
+
+
+class ExpectedSoftPyramidPress(ExpectedPyramidPress):
+    """ExpectedAttention with mild layer budgets instead of aggressive PyramidKV."""
+
+    def __init__(
+        self,
+        compression_ratio: float = 0.0,
+        n_future_positions: int = 512,
+        n_sink: int = 4,
+        min_layer_ratio: float = 0.75,
+        max_layer_ratio: float = 1.25,
+    ) -> None:
+        super().__init__(
+            compression_ratio=compression_ratio,
+            n_future_positions=n_future_positions,
+            n_sink=n_sink,
+            window_size=n_sink,
+            beta=20,
+        )
+        self.min_layer_ratio = min_layer_ratio
+        self.max_layer_ratio = max_layer_ratio
+
+    def get_layer_budget(self, module: nn.Module, q_len: int) -> int:
+        base = max(1, int(q_len * (1 - self.compression_ratio)))
+        n_layers = max(1, int(module.config.num_hidden_layers))
+        if n_layers == 1:
+            factor = 1.0
+        else:
+            factor = self.max_layer_ratio - (self.max_layer_ratio - self.min_layer_ratio) * (
+                module.layer_idx / (n_layers - 1)
+            )
+        return min(q_len, max(self.n_sink, round(base * factor)))
+
+
+class ResidualSoftPyramidPress(ExpectedObservedResidualPress):
+    """Residual hybrid scoring with the same mild layer budget schedule."""
+
+    def __init__(
+        self,
+        compression_ratio: float = 0.0,
+        n_future_positions: int = 512,
+        n_sink: int = 4,
+        min_layer_ratio: float = 0.75,
+        max_layer_ratio: float = 1.25,
+    ) -> None:
+        super().__init__(
+            compression_ratio=compression_ratio,
+            n_future_positions=n_future_positions,
+            n_sink=n_sink,
+        )
+        self.min_layer_ratio = min_layer_ratio
+        self.max_layer_ratio = max_layer_ratio
+
+    def get_layer_budget(self, module: nn.Module, k_len: int) -> int:
+        base = max(1, int(k_len * (1 - self.compression_ratio)))
+        n_layers = max(1, int(module.config.num_hidden_layers))
+        if n_layers == 1:
+            factor = 1.0
+        else:
+            factor = self.max_layer_ratio - (self.max_layer_ratio - self.min_layer_ratio) * (
+                module.layer_idx / (n_layers - 1)
+            )
+        return min(k_len, max(self.n_sink, round(base * factor)))
+
+    def compress(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.compression_ratio == 0:
+            return keys, values
+        n_kept = self.get_layer_budget(module, keys.shape[2])
+        if n_kept >= keys.shape[2]:
+            return keys, values
+        scores = self.score(module, hidden_states, keys, values, attentions, kwargs)
+        return gather_topk(keys, values, scores, n_kept, module.head_dim)
+
+    def forward_hook(self, module, input_args, kwargs, output):
+        return apply_press_to_cache(self, module, input_args, kwargs, output)
+
+
 class ChunkExpectedPress:
     """Chunked ExpectedAttention that tolerates eager attention outputs."""
 
@@ -640,6 +750,21 @@ def make_press(
             n_sink=sink_size,
             n_recent=snap_observation_window,
         ), spec
+    if policy == "expected_observed_residual":
+        return ExpectedObservedResidualPress(
+            compression_ratio=ratio,
+            n_sink=sink_size,
+        ), spec
+    if policy == "expected_soft_pyramid":
+        return ExpectedSoftPyramidPress(
+            compression_ratio=ratio,
+            n_sink=sink_size,
+        ), spec
+    if policy == "residual_soft_pyramid":
+        return ResidualSoftPyramidPress(
+            compression_ratio=ratio,
+            n_sink=sink_size,
+        ), spec
     raise ValueError(f"Unknown policy {policy!r}; choose from {VALID_POLICIES}.")
 
 
@@ -652,6 +777,8 @@ def press_needs_attentions(press) -> bool:
         "TOVAPress",
         "HybridExpectedObservedPress",
         "HybridSoftPyramidPress",
+        "ExpectedObservedResidualPress",
+        "ResidualSoftPyramidPress",
     }
 
 

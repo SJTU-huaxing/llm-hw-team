@@ -31,6 +31,9 @@ POLICY_LABELS = {
     "chunk_expected": "Chunk+Expected",
     "hybrid_expected_observed": "Hybrid Expected+Observed",
     "hybrid_soft_pyramid": "Hybrid Soft Pyramid",
+    "expected_observed_residual": "Expected+Observed Residual",
+    "expected_soft_pyramid": "Expected Soft Pyramid",
+    "residual_soft_pyramid": "Residual Soft Pyramid",
 }
 
 

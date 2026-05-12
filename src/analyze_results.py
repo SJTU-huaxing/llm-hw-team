@@ -60,19 +60,27 @@ def analyze(ppl_path: Path, benchmark_path: Path, max_kept_fraction: float) -> t
     candidates["pareto_frontier"] = candidates.apply(lambda row: is_pareto_frontier(row, candidates), axis=1)
     candidates = candidates.sort_values(["pareto_frontier", "balanced_rank", "avg_ppl"], ascending=[False, True, True])
     best = candidates.iloc[0].to_dict() if not candidates.empty else {}
-    hybrid = candidates[candidates["policy"] == "hybrid_soft_pyramid"]
-    hybrid_record = hybrid.iloc[0].to_dict() if not hybrid.empty else {}
+    candidates["selected"] = candidates["policy"].eq(best.get("policy"))
+    expected_soft = candidates[candidates["policy"] == "expected_soft_pyramid"]
+    expected_soft_record = expected_soft.iloc[0].to_dict() if not expected_soft.empty else {}
+    hybrid_soft = candidates[candidates["policy"] == "hybrid_soft_pyramid"]
+    hybrid_soft_record = hybrid_soft.iloc[0].to_dict() if not hybrid_soft.empty else {}
     best_rank = float(best.get("balanced_rank", 0.0)) or 1.0
-    hybrid_within_10pct = bool(
-        hybrid_record and float(hybrid_record["balanced_rank"]) <= best_rank * 1.10
+    expected_soft_within_10pct = bool(
+        expected_soft_record and float(expected_soft_record["balanced_rank"]) <= best_rank * 1.10
+    )
+    hybrid_soft_within_10pct = bool(
+        hybrid_soft_record and float(hybrid_soft_record["balanced_rank"]) <= best_rank * 1.10
     )
     summary = {
         "ppl_path": str(ppl_path),
         "benchmark_path": str(benchmark_path),
         "max_kept_fraction": max_kept_fraction,
         "selected_policy": best.get("policy"),
-        "hybrid_soft_pyramid_within_10pct": hybrid_within_10pct,
-        "hybrid_soft_pyramid_balanced_rank": hybrid_record.get("balanced_rank"),
+        "expected_soft_pyramid_within_10pct": expected_soft_within_10pct,
+        "expected_soft_pyramid_balanced_rank": expected_soft_record.get("balanced_rank"),
+        "hybrid_soft_pyramid_within_10pct": hybrid_soft_within_10pct,
+        "hybrid_soft_pyramid_balanced_rank": hybrid_soft_record.get("balanced_rank"),
         "best_balanced_rank": best.get("balanced_rank"),
         "selection_rule": "lowest mean rank over average PPL, TPOT, and FLOPs ratio among policies with kept_fraction <= max_kept_fraction and on the Pareto frontier",
     }

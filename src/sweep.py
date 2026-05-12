@@ -36,7 +36,19 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     commands: list[list[str]] = []
-    fixed_policies = ["dense", "streaming", "snapkv", "pyramidkv", "expected", "expected_pyramid"]
+    fixed_policies = [
+        "dense",
+        "streaming",
+        "snapkv",
+        "pyramidkv",
+        "expected",
+        "expected_soft_pyramid",
+        "expected_pyramid",
+        "observed",
+        "tova",
+        "hybrid_expected_observed",
+        "hybrid_soft_pyramid",
+    ]
     for budget in args.budgets:
         common_flag = ["--allow-fallback"] if args.allow_fallback else []
         commands.append(

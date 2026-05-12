@@ -53,6 +53,9 @@ def main() -> None:
         "chunk_expected",
         "hybrid_expected_observed",
         "hybrid_soft_pyramid",
+        "expected_observed_residual",
+        "expected_soft_pyramid",
+        "residual_soft_pyramid",
     )
 
     lengths_by_policy = {}
@@ -87,6 +90,8 @@ def main() -> None:
     assert len(set(lengths_by_policy["layer_adaptive_expected_pyramid"])) > 1
     assert len(set(lengths_by_policy["hybrid_soft_pyramid"])) > 1
     assert min(lengths_by_policy["hybrid_soft_pyramid"]) >= 36
+    assert len(set(lengths_by_policy["expected_soft_pyramid"])) > 1
+    assert len(set(lengths_by_policy["residual_soft_pyramid"])) > 1
     print("Smoke test passed.")
 
 

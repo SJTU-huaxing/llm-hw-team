@@ -10,7 +10,7 @@
 \usepackage{amsmath}
 \usepackage{microtype}
 
-\title{Balanced Hybrid KVPress Compression for Training-Free Pythia-70M Inference}
+\title{Balanced Expected-Pyramid KVPress Compression for Training-Free Pythia-70M Inference}
 
 \author{%
   Group Project Team\\
@@ -23,7 +23,7 @@
 \maketitle
 
 \begin{abstract}
-KV cache compression reduces autoregressive inference memory, but aggressive pruning often trades quality for speed. We study this tradeoff on EleutherAI/Pythia-70M with NVIDIA KVPress, no training, and fp32 eager attention. Beyond Dense, StreamingLLM, SnapKV, PyramidKV, ExpectedAttention, ObservedAttention, and TOVA baselines, we implement two KVPress-compatible hybrid presses. The selected method, Hybrid Expected-Observed, combines expected future attention, observed heavy-hitter attention, and value norm scores while protecting sink and recent tokens. At a 132-token target cache for a 512-token context, it lies on the Pareto frontier and has the best equal-rank balance over average perplexity, TPOT, and decode-attention FLOPs, while ExpectedAttention remains the strongest quality baseline. We report the negative result that adding a soft pyramid budget did not improve the simpler hybrid, and provide code, results, plots, and a reproducible Conda environment.
+KV cache compression reduces autoregressive inference memory, but aggressive pruning often trades quality for speed. We study this tradeoff on EleutherAI/Pythia-70M with NVIDIA KVPress, no training, and fp32 eager attention. Beyond Dense, StreamingLLM, SnapKV, PyramidKV, ExpectedAttention, ObservedAttention, and TOVA baselines, we iteratively test hybrid and layer-budget variants. The selected aggressive-compression method is Expected Soft Pyramid: it keeps ExpectedAttention as the token scorer and applies a mild low-to-high layer budget schedule. At a 132-token target cache for a 512-token context, it lies on the Pareto frontier and has the best equal-rank balance over average perplexity, TPOT, and decode-attention FLOPs. We also report that adding observed-attention residuals often hurts WikiText quality, which makes the conservative ExpectedAttention-based variant the most reliable innovation.
 \end{abstract}
 
 \section{Introduction}
@@ -47,17 +47,22 @@ Layer & Components \\
 \midrule
 Attention mechanism & ExpectedAttention, ObservedAttention/TOVA, value norm \\
 Per-layer compression & StreamingLLM, SnapKV, PyramidKV, observed/top-$k$ scorers \\
-Inter-layer compression & Pyramid budgets, lazy gate, soft hybrid budget ablation \\
+Inter-layer compression & Pyramid budgets, lazy gate, expected soft budget ablation \\
 Macro architecture & KVPress pipeline, prefill-once compression, unified timing \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Hybrid Expected-Observed uses
+Expected Soft Pyramid uses the ExpectedAttention score from KVPress but changes the budget per layer:
+\[
+B_\ell=\mathrm{round}(B\alpha_\ell),\quad
+\alpha_\ell\in[1.25,0.75],
+\]
+where $\alpha_\ell$ decreases linearly from lower to higher layers and averages to one. This keeps the global target cache size unchanged while testing the common observation that lower layers can benefit from broader lexical context. Sink tokens are always protected. We also test Hybrid Expected-Observed,
 \[
 s = 0.55\,\hat{s}_{\mathrm{expected}} + 0.30\,\hat{s}_{\mathrm{observed}} + 0.15\,\hat{s}_{\mathrm{vnorm}},
 \]
-where each score is min-max normalized per batch and head. Sink tokens and a 32-token recent window receive a protection boost before top-$k$ selection. Hybrid Soft Pyramid uses the same score but allocates a mild layer budget from low to high layers with factors from 1.25 to 0.75 and a floor of sink plus recent tokens. This tests whether layer non-uniformity helps once the token scorer is already hybrid.
+where each score is min-max normalized per batch and head. Sink tokens and a 32-token recent window receive a protection boost before top-$k$ selection. Residual and soft-pyramid hybrid variants are retained as ablations.
 
 \section{Experiments}
 
@@ -74,15 +79,15 @@ We first screen new baselines and hybrids on 256-token contexts and target cache
 \toprule
 Policy & Avg PPL & Kept & TPOT & FLOPs \\
 \midrule
-Dense & 21.344 & 1.000 & 0.00579 & 1.000 \\
-ExpectedAttention & 26.326 & 0.258 & 0.00580 & 0.281 \\
-Expected+Pyramid & 35.066 & 0.259 & 0.00572 & 0.282 \\
-Layer-adaptive Expected+Pyramid & 37.279 & 0.259 & 0.00577 & 0.282 \\
-Hybrid Expected-Observed & 37.870 & 0.258 & 0.00575 & 0.281 \\
-Hybrid Soft Pyramid & 38.884 & 0.258 & 0.00576 & 0.281 \\
-ObservedAttention & 40.107 & 0.258 & 0.00572 & 0.281 \\
-StreamingLLM & 46.148 & 0.258 & 0.00587 & 0.281 \\
-TOVA & 53.386 & 0.258 & 0.00588 & 0.281 \\
+Dense & 21.344 & 1.000 & 0.006071 & 1.000 \\
+ExpectedAttention & 26.326 & 0.258 & 0.006373 & 0.281 \\
+Expected Soft Pyramid & 28.342 & 0.258 & 0.006066 & 0.281 \\
+Expected+Pyramid & 35.066 & 0.259 & 0.006056 & 0.282 \\
+Hybrid Expected-Observed & 37.870 & 0.258 & 0.006080 & 0.281 \\
+Hybrid Soft Pyramid & 38.884 & 0.258 & 0.006064 & 0.281 \\
+SnapKV & 42.340 & 0.258 & 0.005959 & 0.281 \\
+StreamingLLM & 46.148 & 0.258 & 0.006148 & 0.281 \\
+TOVA & 53.386 & 0.258 & 0.006146 & 0.281 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -96,9 +101,9 @@ TOVA & 53.386 & 0.258 & 0.00588 & 0.281 \\
 \toprule
 Target & Selected policy & Avg PPL & TPOT & FLOPs \\
 \midrule
-132 & Hybrid Expected-Observed & 37.870 & 0.00575 & 0.281 \\
-192 & ExpectedAttention & 22.407 & 0.00599 & 0.395 \\
-256 & Hybrid Expected-Observed & 26.329 & 0.00574 & 0.516 \\
+132 & Expected Soft Pyramid & 28.342 & 0.006066 & 0.281 \\
+192 & ExpectedAttention & 22.407 & 0.006006 & 0.395 \\
+256 & Hybrid Expected-Observed & 26.329 & 0.006105 & 0.516 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -112,7 +117,7 @@ Target & Selected policy & Avg PPL & TPOT & FLOPs \\
 
 \section{Analysis and Limitations}
 
-The main result is not that the hybrid scorer always minimizes PPL. ExpectedAttention is clearly the quality anchor, especially on WikiText-2. The hybrid is selected by the assignment's balanced rank because its TPOT is close to the fastest policies while preserving a moderate quality level under aggressive compression. Hybrid Soft Pyramid is a useful negative ablation: adding layer non-uniformity to the hybrid score does not dominate the simpler uniform-budget hybrid.
+The main result is not that a more complicated scorer always wins. ExpectedAttention is clearly the quality anchor, especially on WikiText-2. The successful innovation is conservative: Expected Soft Pyramid changes the inter-layer budget while keeping the ExpectedAttention scorer intact. It gives up about 2 average PPL relative to ExpectedAttention at target 132, but improves TPOT and remains on the Pareto frontier. In contrast, adding observed-attention residuals improves some PG-19 cases but tends to damage WikiText quality, so we report those variants as negative ablations rather than the recommended method.
 
 The evaluation is intentionally small and reproducible: one model, no training, two datasets, fixed seeds, and one GPU. Timing differences are small at Pythia-70M scale, so the paper reports exact CSVs rather than over-claiming hardware speedups. We do not implement MQA/GQA/MLA or YOCO-style cross-layer sharing because those require architecture or weight changes outside the no-training setting. KVPress SimLayerKV is excluded because its full-RoPE assumption is incompatible with GPT-NeoX partial RoPE without further changes.
 

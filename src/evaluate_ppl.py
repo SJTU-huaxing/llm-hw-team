@@ -219,6 +219,7 @@ def parse_args() -> argparse.Namespace:
         default=[
             "dense",
             "expected",
+            "expected_soft_pyramid",
             "expected_pyramid",
             "layer_adaptive_expected_pyramid",
             "observed",
