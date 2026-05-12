@@ -15,6 +15,7 @@ from typing import Iterable
 import torch
 from torch import nn
 from kvpress import ExpectedAttentionPress as KVPressExpectedAttentionPress
+from kvpress.presses.scorer_press import ScorerPress
 
 
 VALID_POLICIES: tuple[str, ...] = (
@@ -25,8 +26,20 @@ VALID_POLICIES: tuple[str, ...] = (
     "expected",
     "expected_pyramid",
     "layer_adaptive_expected_pyramid",
+    "observed",
+    "tova",
+    "knorm",
+    "keydiff",
+    "critical_expected",
+    "chunk_expected",
+    "hybrid_expected_observed",
+    "hybrid_soft_pyramid",
 )
-POLICY_ALIASES = {"full": "dense", "proposed": "layer_adaptive_expected_pyramid"}
+POLICY_ALIASES = {
+    "full": "dense",
+    "proposed": "hybrid_soft_pyramid",
+    "balanced": "hybrid_soft_pyramid",
+}
 
 
 @dataclass(frozen=True)
@@ -147,8 +160,11 @@ def patch_pythia_for_kvpress(model) -> None:
         attention.layer_idx = idx
         attention.head_dim = head_dim
         attention.num_key_value_heads = config.num_key_value_heads
+        attention.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        config.head_dim = head_dim
         attention.__dict__["rotary_emb"] = model.gpt_neox.rotary_emb
         attention.__dict__["q_proj"] = GPTNeoXQueryProjection(attention)
+        attention.__dict__["o_proj"] = attention.dense
 
 
 class ExpectedPyramidPress:
@@ -300,6 +316,197 @@ class LayerAdaptiveExpectedPyramidPress(ExpectedPyramidPress):
         return super().compress(module, hidden_states, keys, values, attentions, kwargs)
 
 
+class HybridExpectedObservedPress(ScorerPress):
+    """Balanced scorer mixing expected attention, observed attention, and value norm."""
+
+    def __init__(
+        self,
+        compression_ratio: float = 0.0,
+        n_future_positions: int = 512,
+        n_sink: int = 4,
+        n_recent: int = 32,
+        expected_weight: float = 0.55,
+        observed_weight: float = 0.30,
+        value_weight: float = 0.15,
+        use_covariance: bool = True,
+        use_vnorm: bool = False,
+    ) -> None:
+        super().__init__(compression_ratio=compression_ratio)
+        self.expected = PythiaExpectedAttentionPress(
+            compression_ratio=compression_ratio,
+            n_future_positions=n_future_positions,
+            n_sink=n_sink,
+            use_covariance=use_covariance,
+            use_vnorm=use_vnorm,
+        )
+        total = max(expected_weight + observed_weight + value_weight, 1e-9)
+        self.expected_weight = expected_weight / total
+        self.observed_weight = observed_weight / total
+        self.value_weight = value_weight / total
+        self.n_sink = n_sink
+        self.n_recent = n_recent
+
+    def post_init_from_model(self, model):
+        self.expected.post_init_from_model(model)
+
+    @staticmethod
+    def _normalize(scores: torch.Tensor) -> torch.Tensor:
+        scores = scores.float()
+        min_scores = scores.amin(dim=-1, keepdim=True)
+        max_scores = scores.amax(dim=-1, keepdim=True)
+        return (scores - min_scores) / (max_scores - min_scores + 1e-6)
+
+    def _observed_scores(self, attentions: torch.Tensor | None, keys: torch.Tensor) -> torch.Tensor:
+        if attentions is None:
+            return torch.zeros(keys.shape[:3], device=keys.device, dtype=keys.dtype)
+        scores = attentions.float().sum(dim=2)
+        n_tokens = keys.shape[2]
+        denom = torch.arange(n_tokens, 0, -1, device=keys.device, dtype=scores.dtype)
+        scores = scores / denom
+        if scores.shape[1] != keys.shape[1]:
+            groups = scores.shape[1] // keys.shape[1]
+            scores = scores.view(scores.shape[0], keys.shape[1], groups, n_tokens).mean(dim=2)
+        return scores
+
+    def score(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs,
+    ) -> torch.Tensor:
+        expected = self._normalize(self.expected.score(module, hidden_states, keys, values, attentions, kwargs))
+        observed = self._normalize(self._observed_scores(attentions, keys))
+        value_norm = self._normalize(values.norm(dim=-1))
+        scores = (
+            self.expected_weight * expected
+            + self.observed_weight * observed
+            + self.value_weight * value_norm
+        )
+        return protect_sink_recent(scores, self.n_sink, self.n_recent)
+
+
+class HybridSoftPyramidPress(HybridExpectedObservedPress):
+    """Hybrid scoring with mild layer-wise budgets for PPL-speed balance."""
+
+    def __init__(
+        self,
+        compression_ratio: float = 0.0,
+        n_future_positions: int = 512,
+        n_sink: int = 4,
+        n_recent: int = 32,
+        expected_weight: float = 0.55,
+        observed_weight: float = 0.30,
+        value_weight: float = 0.15,
+        min_layer_ratio: float = 0.75,
+        max_layer_ratio: float = 1.25,
+    ) -> None:
+        super().__init__(
+            compression_ratio=compression_ratio,
+            n_future_positions=n_future_positions,
+            n_sink=n_sink,
+            n_recent=n_recent,
+            expected_weight=expected_weight,
+            observed_weight=observed_weight,
+            value_weight=value_weight,
+        )
+        self.min_layer_ratio = min_layer_ratio
+        self.max_layer_ratio = max_layer_ratio
+
+    def get_layer_budget(self, module: nn.Module, k_len: int) -> int:
+        base = max(1, int(k_len * (1 - self.compression_ratio)))
+        n_layers = max(1, int(module.config.num_hidden_layers))
+        if n_layers == 1:
+            factor = 1.0
+        else:
+            factor = self.max_layer_ratio - (self.max_layer_ratio - self.min_layer_ratio) * (
+                module.layer_idx / (n_layers - 1)
+            )
+        floor = min(k_len, self.n_sink + self.n_recent)
+        return min(k_len, max(floor, round(base * factor)))
+
+    def compress(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.compression_ratio == 0:
+            return keys, values
+        n_kept = self.get_layer_budget(module, keys.shape[2])
+        if n_kept >= keys.shape[2]:
+            return keys, values
+        scores = self.score(module, hidden_states, keys, values, attentions, kwargs)
+        return gather_topk(keys, values, scores, n_kept, module.head_dim)
+
+    def forward_hook(self, module, input_args, kwargs, output):
+        return apply_press_to_cache(self, module, input_args, kwargs, output)
+
+
+class ChunkExpectedPress:
+    """Chunked ExpectedAttention that tolerates eager attention outputs."""
+
+    def __init__(self, compression_ratio: float, n_sink: int = 4, chunk_length: int = 128) -> None:
+        self.press = PythiaExpectedAttentionPress(compression_ratio=compression_ratio, n_sink=n_sink)
+        self.compression_ratio = compression_ratio
+        self.chunk_length = chunk_length
+
+    def post_init_from_model(self, model):
+        self.press.post_init_from_model(model)
+
+    def compress(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.compression_ratio == 0:
+            return keys, values
+        kv_len = keys.shape[2]
+        chunk_indices = []
+        for start in range(0, kv_len, self.chunk_length):
+            stop = min(kv_len, start + self.chunk_length)
+            scores = self.press.score(
+                module,
+                hidden_states[:, start:stop],
+                keys[:, :, start:stop],
+                values[:, :, start:stop],
+                None,
+                kwargs,
+            )
+            n_kept = max(1, int((stop - start) * (1 - self.compression_ratio)))
+            chunk_indices.append(start + scores.topk(n_kept, dim=-1).indices)
+        indices = torch.cat(chunk_indices, dim=-1)
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, module.head_dim)
+        return keys.gather(2, indices).contiguous(), values.gather(2, indices).contiguous()
+
+    def forward_hook(self, module, input_args, kwargs, output):
+        return apply_press_to_cache(self, module, input_args, kwargs, output)
+
+
+def protect_sink_recent(scores: torch.Tensor, n_sink: int, n_recent: int) -> torch.Tensor:
+    k_len = scores.shape[-1]
+    protected = scores.clone()
+    if k_len == 0:
+        return protected
+    boost = protected.amax(dim=-1, keepdim=True) + 1.0
+    sink_end = min(n_sink, k_len)
+    if sink_end > 0:
+        protected[..., :sink_end] = boost
+    recent_start = max(sink_end, k_len - max(0, n_recent))
+    if recent_start < k_len:
+        protected[..., recent_start:] = boost
+    return protected
+
+
 def gather_topk(
     keys: torch.Tensor,
     values: torch.Tensor,
@@ -370,7 +577,16 @@ def make_press(
     if policy == "dense":
         return None, spec
 
-    from kvpress import PyramidKVPress, SnapKVPress, StreamingLLMPress
+    from kvpress import (
+        CriticalKVPress,
+        KeyDiffPress,
+        KnormPress,
+        ObservedAttentionPress,
+        PyramidKVPress,
+        SnapKVPress,
+        StreamingLLMPress,
+        TOVAPress,
+    )
 
     if policy == "streaming":
         return StreamingLLMPress(compression_ratio=ratio, n_sink=sink_size), spec
@@ -380,6 +596,23 @@ def make_press(
         return PyramidKVPress(compression_ratio=ratio, window_size=pyramid_window_size, beta=pyramid_beta), spec
     if policy == "expected":
         return PythiaExpectedAttentionPress(compression_ratio=ratio, n_sink=sink_size), spec
+    if policy == "observed":
+        return ObservedAttentionPress(compression_ratio=ratio), spec
+    if policy == "tova":
+        return TOVAPress(compression_ratio=ratio), spec
+    if policy == "knorm":
+        return KnormPress(compression_ratio=ratio), spec
+    if policy == "keydiff":
+        return KeyDiffPress(compression_ratio=ratio), spec
+    if policy == "critical_expected":
+        base = PythiaExpectedAttentionPress(compression_ratio=ratio, n_sink=sink_size, use_vnorm=False)
+        return CriticalKVPress(base, first_stage_ratio=0.5), spec
+    if policy == "chunk_expected":
+        return ChunkExpectedPress(
+            compression_ratio=ratio,
+            n_sink=sink_size,
+            chunk_length=max(32, min(128, target_cache_size)),
+        ), spec
     if policy == "expected_pyramid":
         return ExpectedPyramidPress(
             compression_ratio=ratio,
@@ -395,6 +628,18 @@ def make_press(
             beta=pyramid_beta,
             lazy_threshold=lazy_threshold,
         ), spec
+    if policy == "hybrid_expected_observed":
+        return HybridExpectedObservedPress(
+            compression_ratio=ratio,
+            n_sink=sink_size,
+            n_recent=snap_observation_window,
+        ), spec
+    if policy == "hybrid_soft_pyramid":
+        return HybridSoftPyramidPress(
+            compression_ratio=ratio,
+            n_sink=sink_size,
+            n_recent=snap_observation_window,
+        ), spec
     raise ValueError(f"Unknown policy {policy!r}; choose from {VALID_POLICIES}.")
 
 
@@ -403,6 +648,10 @@ def press_needs_attentions(press) -> bool:
         "SnapKVPress",
         "PyramidKVPress",
         "LayerAdaptiveExpectedPyramidPress",
+        "ObservedAttentionPress",
+        "TOVAPress",
+        "HybridExpectedObservedPress",
+        "HybridSoftPyramidPress",
     }
 
 

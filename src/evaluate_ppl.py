@@ -216,7 +216,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policies",
         nargs="+",
-        default=["dense", "streaming", "snapkv", "pyramidkv", "expected", "expected_pyramid", "layer_adaptive_expected_pyramid"],
+        default=[
+            "dense",
+            "expected",
+            "expected_pyramid",
+            "layer_adaptive_expected_pyramid",
+            "observed",
+            "tova",
+            "critical_expected",
+            "chunk_expected",
+            "hybrid_expected_observed",
+            "hybrid_soft_pyramid",
+        ],
     )
     parser.add_argument("--context-len", type=int, default=512)
     parser.add_argument("--continuation-len", type=int, default=128)

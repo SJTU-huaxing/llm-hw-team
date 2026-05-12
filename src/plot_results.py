@@ -23,6 +23,14 @@ POLICY_LABELS = {
     "expected": "ExpectedAttention",
     "expected_pyramid": "Expected+Pyramid",
     "layer_adaptive_expected_pyramid": "Layer-adaptive Expected+Pyramid",
+    "observed": "ObservedAttention",
+    "tova": "TOVA",
+    "knorm": "K-norm",
+    "keydiff": "KeyDiff",
+    "critical_expected": "Critical+Expected",
+    "chunk_expected": "Chunk+Expected",
+    "hybrid_expected_observed": "Hybrid Expected+Observed",
+    "hybrid_soft_pyramid": "Hybrid Soft Pyramid",
 }
 
 

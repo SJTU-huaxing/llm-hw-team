@@ -45,6 +45,14 @@ def main() -> None:
         "expected",
         "expected_pyramid",
         "layer_adaptive_expected_pyramid",
+        "observed",
+        "tova",
+        "knorm",
+        "keydiff",
+        "critical_expected",
+        "chunk_expected",
+        "hybrid_expected_observed",
+        "hybrid_soft_pyramid",
     )
 
     lengths_by_policy = {}
@@ -77,6 +85,8 @@ def main() -> None:
     assert len(set(lengths_by_policy["pyramidkv"])) > 1
     assert len(set(lengths_by_policy["expected_pyramid"])) > 1
     assert len(set(lengths_by_policy["layer_adaptive_expected_pyramid"])) > 1
+    assert len(set(lengths_by_policy["hybrid_soft_pyramid"])) > 1
+    assert min(lengths_by_policy["hybrid_soft_pyramid"]) >= 36
     print("Smoke test passed.")
 
 
