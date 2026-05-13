@@ -26,7 +26,6 @@
 Long-context inference with large language models is often bottlenecked by the growing memory footprint of the KV cache. How can we aggressively compress the cache without training, while maintaining a balanced tradeoff between generation quality, latency, and compute?  We systematically evaluate nine KV compression methods on Pythia-70M using NVIDIA KVPress. Beyond Dense, StreamingLLM, SnapKV, PyramidKV, ExpectedAttention, ObservedAttention, and TOVA baselines, we iteratively test hybrid and layer-budget variants. The selected aggressive-compression method is Expected Soft Pyramid: it keeps ExpectedAttention as the token scorer and applies a mild low-to-high layer budget schedule. At a 132-token target cache for a 512-token context, it lies on the Pareto frontier and has the best equal-rank balance over average perplexity, TPOT, and decode-attention FLOPs. We also report that adding observed-attention residuals often hurts WikiText quality, which makes the conservative ExpectedAttention-based variant the most reliable innovation.
 \end{abstract}
 
-\section{Introduction}
 
 \section{Introduction}
 
