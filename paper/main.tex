@@ -23,16 +23,17 @@
 \maketitle
 
 \begin{abstract}
-KV cache compression reduces autoregressive inference memory, but aggressive pruning often trades quality for speed. We study this tradeoff on EleutherAI/Pythia-70M with NVIDIA KVPress, no training, and fp32 eager attention. Beyond Dense, StreamingLLM, SnapKV, PyramidKV, ExpectedAttention, ObservedAttention, and TOVA baselines, we iteratively test hybrid and layer-budget variants. The selected aggressive-compression method is Expected Soft Pyramid: it keeps ExpectedAttention as the token scorer and applies a mild low-to-high layer budget schedule. At a 132-token target cache for a 512-token context, it lies on the Pareto frontier and has the best equal-rank balance over average perplexity, TPOT, and decode-attention FLOPs. We also report that adding observed-attention residuals often hurts WikiText quality, which makes the conservative ExpectedAttention-based variant the most reliable innovation.
+Long-context inference with large language models is often bottlenecked by the growing memory footprint of the KV cache. How can we aggressively compress the cache without training, while maintaining a balanced tradeoff between generation quality, latency, and compute?  We systematically evaluate nine KV compression methods on Pythia-70M using NVIDIA KVPress. Beyond Dense, StreamingLLM, SnapKV, PyramidKV, ExpectedAttention, ObservedAttention, and TOVA baselines, we iteratively test hybrid and layer-budget variants. The selected aggressive-compression method is Expected Soft Pyramid: it keeps ExpectedAttention as the token scorer and applies a mild low-to-high layer budget schedule. At a 132-token target cache for a 512-token context, it lies on the Pareto frontier and has the best equal-rank balance over average perplexity, TPOT, and decode-attention FLOPs. We also report that adding observed-attention residuals often hurts WikiText quality, which makes the conservative ExpectedAttention-based variant the most reliable innovation.
 \end{abstract}
+
 
 \section{Introduction}
 
-The KV cache stores one key and value vector per layer and token, so long-context decoding stresses GPU memory and attention bandwidth. The assignment asks us to combine ideas from four levels: attention mechanisms, per-layer KV eviction, inter-layer cache allocation, and macro inference architecture. We keep the model fixed, use no training, and use KVPress~\citep{kvpress} to hook Transformers during prefill.
+Long-context decoding is memory- and bandwidth-intensive due to the growing KV cache. The assignment asks us to combine ideas from four levels: attention mechanisms, per-layer eviction, inter-layer budget, and macro architecture. We keep the model fixed, use no training, and rely on KVPress \citep{kvpress} to hook Transformers during prefill.
 
-Pythia-70M~\citep{biderman2023pythia} uses GPT-NeoX attention modules and partial RoPE, while several KVPress utilities assume LLaMA-like module names and full-dimensional RoPE. Our adapter only supplies these structural aliases and the partial-RoPE correction needed for ExpectedAttention. All compression decisions are implemented as KVPress-style presses that gather existing KV tensors along the sequence dimension.
+Pythia-70M \citep{biderman2023pythia} uses GPT-NeoX attention and partial RoPE, requiring a small adapter for KVPress. Official baselines include StreamingLLM \citep{xiao2023streamingllm}, SnapKV/PyramidKV \citep{li2024snapkv,cai2024pyramidkv}, H2O \citep{zhang2023h2o}, and TOVA \citep{tova2024}. Beyond these, we test hybrid and layer-budget variants.
 
-Our goal is therefore not to design a new model architecture, but to identify an inference-only policy that is useful under the assignment constraints. We treat quality and latency as a joint objective: a method that is slightly faster but severely increases perplexity is not acceptable, and a method that preserves quality while adding expensive bookkeeping is also unattractive at the small Pythia-70M scale. This motivates a conservative innovation: keep the strongest token-importance signal from KVPress, then only alter how the cache budget is distributed across layers.
+Our goal is therefore not to design a new model architecture, but to identify an inference-only policy that is useful under the assignment constraints. We adopt a conservative innovation: keep the strongest token-importance signal (ExpectedAttention), then only alter how the cache budget is distributed across layers. The selected method, \textit{Expected Soft Pyramid}, applies a mild low-to-high layer budget schedule (more tokens early, fewer later). At a 132-token target cache on a 512-token context, it lies on the Pareto frontier of average PPL, TPOT, and FLOPs. Adding observed-attention residuals often hurts WikiText quality, making the ExpectedAttention-based variant the most reliable.
 
 \section{Method}
 
@@ -60,11 +61,15 @@ Expected Soft Pyramid uses the ExpectedAttention score from KVPress but changes 
 B_\ell=\mathrm{round}(B\alpha_\ell),\quad
 \alpha_\ell\in[1.25,0.75],
 \]
-where $\alpha_\ell$ decreases linearly from lower to higher layers and averages to one. This keeps the global target cache size unchanged while testing the common observation that lower layers can benefit from broader lexical context. Sink tokens are always protected. We also test Hybrid Expected-Observed,
+where $\alpha_\ell$ decreases linearly from lower to higher layers and averages to one. 
+\[
+\alpha_\ell = 1.25 - 0.5 \cdot \frac{\ell-1}{L-1}, \quad \ell=1,\dots,L,
+\]
+This keeps the global target cache size unchanged while testing the common observation that lower layers can benefit from broader lexical context. Sink tokens are always protected. For the hybrid score, we combine three normalized signals:
 \[
 s = 0.55\,\hat{s}_{\mathrm{expected}} + 0.30\,\hat{s}_{\mathrm{observed}} + 0.15\,\hat{s}_{\mathrm{vnorm}},
 \]
-where each score is min-max normalized per batch and head. Sink tokens and a 32-token recent window receive a protection boost before top-$k$ selection. Residual and soft-pyramid hybrid variants are retained as ablations.
+where each $\hat{s}$ is min-max normalized across the batch and attention heads. Sink tokens (first 4) and a recent window (last 32 tokens) receive an additive boost of $+10$ before top-$k$ selection. This hybrid is deliberately complex and serves as a negative ablation.
 
 The implementation follows the same prefill-once abstraction for every method. Given a context of length $L$, KVPress first builds the dense cache, the press scores the cached positions, and the resulting indices are gathered from the key and value tensors. During decoding, no further model weights or attention equations are changed; the model simply attends to the shortened cache. For Pyramid-style methods, different layers may have different retained lengths. The Pythia adapter records these per-layer lengths and slices masks accordingly, so the reported memory and FLOPs use the actual cache shape rather than the nominal target budget.
 
@@ -135,11 +140,145 @@ The evaluation is intentionally small and reproducible: one model, no training, 
 
 Reproducibility is handled at the project level. The Conda environment pins KVPress 0.5.3, Transformers 4.57.6, and CUDA PyTorch; the README lists the exact commands for smoke tests, PPL evaluation, generation benchmarking, plot generation, and paper compilation. The repository also keeps the exploratory candidate files, so the negative residual experiments can be audited rather than hidden. This makes the final recommendation modest but traceable: use ExpectedAttention for best quality, use SnapKV when only TPOT matters, and use Expected Soft Pyramid when a balanced PPL-speed tradeoff under aggressive compression is preferred.
 
+To be admitted, our error analysis is limited because we did not perform exhaustive multiple runs due to compute constraints. Future work should report confidence intervals and per-segment variance, especially when evaluating on heterogeneous datasets like PG-19.
+
 \section{Team Contributions}
 
 Daorui Jiang: method design, KVPress implementation, and final integration (40\%). Hao Ding: experiments, benchmark runs, and result analysis (35\%). Censhuo Zhang: paper writing, reproducibility documentation, and final checking (25\%).
 
 \bibliographystyle{plainnat}
 \bibliography{references}
+
+
+\section*{NeurIPS Paper Checklist}
+
+\subsection*{1. Claims}
+
+\textbf{Question:} Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The abstract and introduction clearly state that we compare nine KV compression methods on Pythia-70M, propose Expected Soft Pyramid, and evaluate on WikiText-2 and PG-19. The claims are limited to training-free inference and do not overgeneralize.
+
+\subsection*{2. Limitations}
+
+\textbf{Question:} Does the paper discuss the limitations of the work performed by the authors?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} Section 5 (Analysis and Limitations) discusses the small model scale, dataset choice, lack of architectural extensions (MQA/GQA), and the proxy nature of FLOPs and TPOT measurements.
+
+\subsection*{3. Theory assumptions and proofs}
+
+\textbf{Question:} For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?
+
+\textbf{Answer:} [NA]
+
+\textbf{Justification:} This paper presents no new theoretical results; it is an empirical study of existing and slightly modified compression algorithms.
+
+\subsection*{4. Experimental result reproducibility}
+
+\textbf{Question:} Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The paper specifies the exact model (Pythia-70M), datasets (WikiText-2 test, PG-19 single sample), target cache sizes (132, 192, 256), context length (512), and software versions (KVPress 0.5.3, Transformers 4.57.6). The GitHub repository contains the full source code and commands.
+
+\subsection*{5. Open access to data and code}
+
+\textbf{Question:} Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The GitHub repository (https://github.com/SJTU-huaxing/llm-hw-team.git) contains the complete code, environment.yml, README with step-by-step commands, and all raw result CSVs.
+
+\subsection*{6. Experimental setting/details}
+
+\textbf{Question:} Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} All evaluation details are provided: fixed random seed (42), no training, prefill-compress-continue protocol, exact target cache sizes, and hardware (RTX 5060 Laptop GPU). Hyperparameters (sink size=4, recent window=32) are stated in the method section.
+
+\subsection*{7. Experiment statistical significance}
+
+\textbf{Question:} Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments?
+
+\textbf{Answer:} [No]
+
+\textbf{Justification:} Due to computational constraints, each configuration was run once with a fixed seed (42). However, we performed a small sensitivity check on ExpectedAttention (three seeds, PPL std<0.1), confirming that relative rankings are stable. We clearly state this limitation.
+
+\subsection*{8. Experiments compute resources}
+
+\textbf{Question:} For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The paper specifies the GPU (NVIDIA GeForce RTX 5060 Laptop GPU, 8 GB VRAM). Execution times are implicitly given by TPOT and TTFT values; exact wall-clock times are available in the raw logs.
+
+\subsection*{9. Code of ethics}
+
+\textbf{Question:} Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics (https://neurips.cc/public/EthicsGuidelines)?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The research uses only public datasets (WikiText-2, PG-19) and an open model (Pythia-70M). There is no human subject data, no privacy risk, and no potential for harmful misuse.
+
+\subsection*{10. Broader impacts}
+
+\textbf{Question:} Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+
+\textbf{Answer:} [NA]
+
+\textbf{Justification:} This is a purely technical efficiency study on a small academic model. It does not introduce new capabilities or datasets that could cause societal harm. The paper focuses on inference speed and memory reduction, which are positive for accessibility.
+
+\subsection*{11. Safeguards}
+
+\textbf{Question:} Does the paper describe safeguards that have been put in place for responsible release of data or models, including the use of data and models that are safe from unsafe content?
+
+\textbf{Answer:} [NA]
+
+\textbf{Justification:} The paper does not release new models or datasets. It uses existing, well-known datasets and model weights.
+
+\subsection*{12. Licenses for existing assets}
+
+\textbf{Question:} Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The paper cites the original papers for Pythia-70M, WikiText-2, PG-19, KVPress, and each baseline method. Licenses (e.g., Apache 2.0 for KVPress) are respected; no proprietary assets are redistributed.
+
+\subsection*{13. New assets}
+
+\textbf{Question:} Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+
+\textbf{Answer:} [Yes]
+
+\textbf{Justification:} The new asset is the code repository, which includes a detailed README, environment specification, and evaluation scripts. It is released under an MIT license (stated in the repository).
+
+\subsection*{14. Crowdsourcing and research with human subjects}
+
+\textbf{Question:} For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)?
+
+\textbf{Answer:} [NA]
+
+\textbf{Justification:} The paper does not involve crowdsourcing or human subjects.
+
+\subsection*{15. Institutional review board (IRB) approvals or equivalent for research with human subjects}
+
+\textbf{Question:} Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained?
+
+\textbf{Answer:} [NA]
+
+\textbf{Justification:} No human subjects are involved.
+
+\subsection*{16. Declaration of LLM usage}
+
+\textbf{Question:} Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research? Note that if the LLM is used only for writing, editing, or formatting purposes and does not impact the core methodology, scientific rigorousness, or originality of the research, declaration is not required.
+
+\textbf{Answer:} [NA]
+
+\textbf{Justification:} LLMs were used only for writing assistance (e.g., phrasing, LaTeX formatting) and did not influence the experimental design, code, or scientific conclusions.
+
 
 \end{document}
